@@ -12,7 +12,14 @@ def linear(
     w: mx.array,
     bias: mx.array | None = None,
 ) -> mx.array:
-    pass
+    output = x @ w.T
+
+    # 添加偏置（如果提供）
+    # bias 形状 (O,) 会自动广播到 (..., O)
+    if bias is not None:
+        output = output + bias
+
+    return output
 
 
 def silu(x: mx.array) -> mx.array:
