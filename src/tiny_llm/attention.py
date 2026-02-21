@@ -98,9 +98,25 @@ class SimpleMultiHeadAttention:
 
 
 def causal_mask(L: int, S: int, dtype: mx.Dtype) -> mx.array:
-    pass
+    i = mx.arange(L)[:, None]           # (L,1)
+    j = mx.arange(S)[None, :]           # (1,S)
 
+    shift = S - L
 
+    mask = mx.where(j <= i + shift, 0.0, float("-inf"))
+    return mask.astype(dtype)
+
+# N.. is zero or more dimensions for batches
+# H_q is the number of query heads
+# H is the number of key/value heads (H_q must be divisible by H)
+# L is the query sequence length
+# S is the key/value sequence length
+# D is the head dimension
+# query: N.. x H_q x L x D
+# key: N.. x H x S x D
+# value: N.. x H x S x D
+# mask: N.. x H_q x L x S
+# output: N.. x H_q x L x D
 def scaled_dot_product_attention_grouped(
     query: mx.array,
     key: mx.array,
@@ -108,7 +124,25 @@ def scaled_dot_product_attention_grouped(
     scale: float | None = None,
     mask: mx.array | str | None = None,
 ) -> mx.array:
-    pass
+    H_q = query.shape[-3]
+    H_kv = key.shape[-3]
+    assert H_q % H_kv == 0, "Number of query heads must be divisible by number of key/value heads"
+
+    n_repeats = H_q // H_kv
+    if n_repeats > 1:
+        key = mx.repeat(key, repeats=n_repeats, axis=-3)
+        value = mx.repeat(value, repeats=n_repeats, axis=-3)
+    
+    if isinstance(mask, str) and mask == "causal":
+        L = query.shape[-2]
+        S = key.shape[-2]
+        mask = causal_mask(L, S, dtype=query.dtype)
+        while mask.ndim < query.ndim:
+            mask = mask[None]
+
+    return scaled_dot_product_attention_simple(
+        query, key, value, scale=scale, mask=mask
+    )
 
 
 def flash_attention(
