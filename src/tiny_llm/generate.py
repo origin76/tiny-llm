@@ -2,6 +2,7 @@ import mlx.core as mx
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 from .qwen2_week1 import Qwen2ModelWeek1
 from .qwen2_week2 import Qwen2ModelWeek2
+from .sampler import make_sampler
 from typing import Callable
 
 
@@ -13,16 +14,17 @@ def simple_generate(
 ) -> str:
     # y: N.. x S, where in week 1 we don't implement batch, so N.. = 1
     # output_logits: N.. x S x vocab_size
+    # Use make_sampler if no sampler provided
+    if sampler is None:
+        sampler = make_sampler(0.0, 1.0, None)
+
     def _step(model, y):
         # y: (1, S) -> output_logits: (1, S, vocab_size)
         output_logits = model(y)
         # 只取最后一个位置的 logits: (1, vocab_size)
         logits = output_logits[:, -1, :]
-        # 贪婪解码：取概率最高的 token
-        if sampler is not None:
-            next_token = sampler(logits)
-        else:
-            next_token = mx.argmax(logits, axis=-1)
+        # 采样解码
+        next_token = sampler(logits)
         return next_token  # shape: (1,)
     
     print(f"Prompt: {prompt}")
