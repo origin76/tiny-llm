@@ -3,6 +3,7 @@ from mlx_lm.tokenizer_utils import TokenizerWrapper
 from .qwen2_week1 import Qwen2ModelWeek1
 from .qwen2_week2 import Qwen2ModelWeek2
 from .sampler import make_sampler
+from .kv_cache import TinyKvCache, TinyKvFullCache
 from typing import Callable
 
 
@@ -60,8 +61,47 @@ def simple_generate(
 def simple_generate_with_kv_cache(
     model: Qwen2ModelWeek2, tokenizer: TokenizerWrapper, prompt: str
 ) -> str:
+    # Initialize KV cache for each layer
+    kv_cache = [TinyKvFullCache() for _ in range(model.num_hidden_layers)]
+
     def _step(model, y, offset, kv_cache):
-        pass
+        # y: (S,) token ids
+        # offset: current sequence length (position of last token processed)
+        # Returns: next token, logprobs
+        logits = model(y[None], offset, kv_cache)  # (1, 1, vocab_size)
+        logits = logits[:, -1, :]  # (1, vocab_size)
+        logprobs = logits - mx.logsumexp(logits, keepdims=True)
+        sampler = lambda x: mx.argmax(x, axis=-1)
+        y = sampler(logprobs)
+        return y, logprobs.squeeze(0)
+
+    # Encode prompt
+    tokens = mx.array(tokenizer.encode(prompt, add_special_tokens=False))
+
+    # Initialize detokenizer for streaming output
+    detokenizer = tokenizer.detokenizer
+    detokenizer.reset()
+
+    offset = 0
+
+    # First iteration is prefill - process entire prompt
+    while True:
+        token, _ = _step(model, tokens, offset, kv_cache)
+        mx.eval(token)
+
+        if token.item() == tokenizer.eos_token_id:
+            break
+
+        detokenizer.add_token(token.item())
+        print(detokenizer.last_segment, end="", flush=True)
+
+        # Update offset: prefill uses prompt length, decode uses 1
+        offset += tokens.size
+        tokens = token
+    
+    detokenizer.finalize()
+
+    return detokenizer.text
 
 
 def speculative_generate(
