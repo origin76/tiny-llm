@@ -1,6 +1,11 @@
 import mlx.core as mx
 from typing import Any
 
+try:
+    from extensions.tiny_llm_ext import quantized_matmul as _quantized_matmul
+except ImportError as e:
+    raise ImportError("Failed to load C++ extension: {}".format(e)) from e
+
 
 def dequantize_linear(mx_layer: Any) -> mx.array:
     w = mx.dequantize(
@@ -14,6 +19,11 @@ def dequantize_linear(mx_layer: Any) -> mx.array:
 
 
 class QuantizedWeights:
+    """
+    Weight: (K,N/8) uint32 
+    scales: (K,N/G) float16
+    biases: (K,N/G) float16
+    """
     def __init__(
         self,
         scales: mx.array,
@@ -48,7 +58,15 @@ def quantized_matmul(
     b: mx.array,
     transpose_b: bool = False,
 ) -> mx.array:
-    pass
+    return _quantized_matmul(
+        scales=scales,
+        biases=biases,
+        group_size=group_size,
+        bits=bits,
+        a=a,
+        b=b,
+        transpose_b=transpose_b,
+    )
 
 
 def quantized_linear(
@@ -56,4 +74,15 @@ def quantized_linear(
     w: QuantizedWeights,
     bias: mx.array | None = None,
 ) -> mx.array:
-    pass
+    output = quantized_matmul(
+        scales=w.scales,
+        biases=w.biases,
+        group_size=w.group_size,
+        bits=w.bits,
+        a=x,
+        b=w.weight,
+        transpose_b=True,
+    )
+    if bias is not None:
+        output = output + bias
+    return output

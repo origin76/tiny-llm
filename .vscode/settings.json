@@ -1,3 +1,9 @@
 {
-    "cmake.ignoreCMakeListsMissing": true
+    "cmake.ignoreCMakeListsMissing": true,
+    "clangd.arguments": [
+        "--background-index",
+        "--compile-commands-dir=${workspaceFolder}/src/extensions/build/tiny_llm_ext._ext",
+        "--header-insertion=never"
+    ],
+    "clangd.path": "clangd"
 }
