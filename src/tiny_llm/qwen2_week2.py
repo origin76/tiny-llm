@@ -1,12 +1,24 @@
 import mlx.core as mx
-from .basics import linear, silu
+from .basics import silu
 from .attention import scaled_dot_product_attention_grouped
 from .layer_norm import RMSNorm
 from .positional_encoding import RoPE
 from typing import Any
 from .embedding import Embedding
-from .quantize import dequantize_linear, QuantizedWeights
+from .quantize import dequantize_linear, QuantizedWeights, quantized_linear
 from .kv_cache import TinyKvCache
+
+
+def cast_quantized_weights(weights: QuantizedWeights, dtype: mx.Dtype) -> QuantizedWeights:
+    if weights.scales.dtype == dtype and weights.biases.dtype == dtype:
+        return weights
+    return QuantizedWeights(
+        scales=weights.scales.astype(dtype),
+        biases=weights.biases.astype(dtype),
+        group_size=weights.group_size,
+        bits=weights.bits,
+        weight=weights.weight,
+    )
 
 
 class Qwen2MultiHeadAttention:
@@ -59,16 +71,10 @@ class Qwen2MultiHeadAttention:
         H = self.num_kv_heads
         D = self.hidden_size // H_q
 
-        # Dequantize weights
-        wq = dequantize_linear(self.wq)
-        wk = dequantize_linear(self.wk)
-        wv = dequantize_linear(self.wv)
-        wo = dequantize_linear(self.wo)
-
         # Linear projections: output shape (B, L_new, H*D)
-        q = linear(x, wq, self.bq)
-        k = linear(x, wk, self.bk)
-        v = linear(x, wv, self.bv)
+        q = quantized_linear(x, self.wq, self.bq)
+        k = quantized_linear(x, self.wk, self.bk)
+        v = quantized_linear(x, self.wv, self.bv)
 
         # Reshape to (B, L_new, H, D)
         q = q.reshape(B, L_new, H_q, D)
@@ -108,7 +114,7 @@ class Qwen2MultiHeadAttention:
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L_new, H_q * D)
 
         # Final linear projection
-        output = linear(attn_output, wo)
+        output = quantized_linear(attn_output, self.wo)
 
         return output
 
@@ -129,15 +135,11 @@ class Qwen2MLP:
         self.w_down = w_down
 
     def __call__(self, x: mx.array) -> mx.array:
-        # Dequantize weights
-        w_gate = dequantize_linear(self.w_gate)
-        w_up = dequantize_linear(self.w_up)
-        w_down = dequantize_linear(self.w_down)
 
-        gate = silu(linear(x, w_gate))
-        up = linear(x, w_up)
+        gate = silu(quantized_linear(x, self.w_gate))
+        up = quantized_linear(x, self.w_up)
         hidden = gate * up
-        return linear(hidden, w_down)
+        return quantized_linear(hidden, self.w_down)
 
 
 class Qwen2TransformerBlock:
@@ -243,22 +245,30 @@ class Qwen2ModelWeek2:
             attn = layer.self_attn
             mlp = layer.mlp
 
+            wq = cast_quantized_weights(QuantizedWeights.from_mlx_layer(attn.q_proj), precision)
+            wk = cast_quantized_weights(QuantizedWeights.from_mlx_layer(attn.k_proj), precision)
+            wv = cast_quantized_weights(QuantizedWeights.from_mlx_layer(attn.v_proj), precision)
+            wo = cast_quantized_weights(QuantizedWeights.from_mlx_layer(attn.o_proj), precision)
+            w_gate = cast_quantized_weights(QuantizedWeights.from_mlx_layer(mlp.gate_proj), precision)
+            w_up = cast_quantized_weights(QuantizedWeights.from_mlx_layer(mlp.up_proj), precision)
+            w_down = cast_quantized_weights(QuantizedWeights.from_mlx_layer(mlp.down_proj), precision)
+
             block = Qwen2TransformerBlock(
                 num_attention_heads=args.num_attention_heads,
                 num_kv_heads=args.num_key_value_heads,
                 hidden_size=args.hidden_size,
                 intermediate_size=args.intermediate_size,
                 rms_norm_eps=args.rms_norm_eps,
-                wq=attn.q_proj,
-                wk=attn.k_proj,
-                wv=attn.v_proj,
-                wo=attn.o_proj,
+                wq=wq,
+                wk=wk,
+                wv=wv,
+                wo=wo,
                 bq=attn.q_proj.bias.astype(precision) if attn.q_proj.bias is not None else None,
                 bk=attn.k_proj.bias.astype(precision) if attn.k_proj.bias is not None else None,
                 bv=attn.v_proj.bias.astype(precision) if attn.v_proj.bias is not None else None,
-                w_gate=mlp.gate_proj,
-                w_up=mlp.up_proj,
-                w_down=mlp.down_proj,
+                w_gate=w_gate,
+                w_up=w_up,
+                w_down=w_down,
                 w_input_layernorm=layer.input_layernorm.weight.astype(precision),
                 w_post_attention_layernorm=layer.post_attention_layernorm.weight.astype(precision),
                 max_seq_len=args.max_position_embeddings,
@@ -274,12 +284,9 @@ class Qwen2ModelWeek2:
         )
 
         if args.tie_word_embeddings:
-            self.lm_head_weight = embed_weight
+            self.w_lm_head = None
         else:
-            lm_head_weight = mlx_model.lm_head.weight
-            if hasattr(mlx_model.lm_head, "scales"):
-                lm_head_weight = dequantize_linear(mlx_model.lm_head)
-            self.lm_head_weight = lm_head_weight.astype(precision)
+            self.w_lm_head = cast_quantized_weights(QuantizedWeights.from_mlx_layer(mlx_model.lm_head), precision)
 
     def __call__(
         self,
@@ -314,6 +321,6 @@ class Qwen2ModelWeek2:
         x = self.norm(x)
 
         # LM Head projection
-        logits = linear(x, self.lm_head_weight)
-
-        return logits
+        if self.w_lm_head is not None:
+            return quantized_linear(x, self.w_lm_head)
+        return self.embedding.as_linear(x)
