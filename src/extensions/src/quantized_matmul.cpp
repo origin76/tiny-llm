@@ -319,8 +319,13 @@ void QuantizedMatmul::eval_gpu(const std::vector<mx::array>& inputs, std::vector
     out.set_data(mx::allocator::malloc(out.nbytes()));
 
     auto library = d.get_library("tiny_llm_ext");
-    const char* kernel_name = (a.dtype() == mx::float16) ? "quantized_matmul_w4a16_g64_f16"
-                                                          : "quantized_matmul_w4a16_g64_bf16";
+    const bool is_f16 = (a.dtype() == mx::float16);
+    const char* kernel_name = nullptr;
+    if (transpose_b_) {
+        kernel_name = is_f16 ? "quantized_matmul_w4a16_g64_t_f16" : "quantized_matmul_w4a16_g64_t_bf16";
+    } else {
+        kernel_name = is_f16 ? "quantized_matmul_w4a16_g64_nt_f16" : "quantized_matmul_w4a16_g64_nt_bf16";
+    }
     auto kernel = d.get_kernel(kernel_name, library);
 
     auto& compute_encoder = d.get_command_encoder(s.index);
@@ -335,19 +340,24 @@ void QuantizedMatmul::eval_gpu(const std::vector<mx::array>& inputs, std::vector
     const int m_i = static_cast<int>(m);
     const int k_i = static_cast<int>(k);
     const int n_i = static_cast<int>(n);
-    const int transpose_i = transpose_b_ ? 1 : 0;
     compute_encoder.set_bytes(m_i, 5);
     compute_encoder.set_bytes(k_i, 6);
     compute_encoder.set_bytes(n_i, 7);
-    compute_encoder.set_bytes(transpose_i, 8);
 
     size_t tgp_size = kernel->maxTotalThreadsPerThreadgroup();
-    const int x_size = 16;
-    int y_size = static_cast<int>(tgp_size / x_size);
+
+    // Single strategy launch tuned for stable mixed prefill/decode throughput.
+    int x_size = 16;
+    int y_cap = 16;
+    if (static_cast<size_t>(x_size) > tgp_size) {
+        x_size = static_cast<int>(tgp_size);
+    }
+
+    int y_size = static_cast<int>(tgp_size / static_cast<size_t>(x_size));
     if (y_size < 1) {
         y_size = 1;
-    } else if (y_size > 16) {
-        y_size = 16;
+    } else if (y_size > y_cap) {
+        y_size = y_cap;
     }
 
     MTL::Size grid_dims = MTL::Size(static_cast<size_t>(m), static_cast<size_t>(n), 1);

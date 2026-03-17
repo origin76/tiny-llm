@@ -50,6 +50,7 @@ class Qwen2MultiHeadAttention:
         self.bv = bv
         self.max_seq_len = max_seq_len
         self.theta = theta
+        self.rope = RoPE(dims=hidden_size // num_heads, seq_len=max_seq_len, base=theta, traditional=False)
         self.use_flash_attention = use_flash_attention
 
     def __call__(
@@ -82,9 +83,8 @@ class Qwen2MultiHeadAttention:
         v = v.reshape(B, L_new, H, D)
 
         # Apply RoPE with offset
-        rope = RoPE(dims=D, seq_len=self.max_seq_len, base=self.theta, traditional=False)
-        q = rope(q, offset=slice(offset, offset + L_new))
-        k = rope(k, offset=slice(offset, offset + L_new))
+        q = self.rope(q, offset=slice(offset, offset + L_new))
+        k = self.rope(k, offset=slice(offset, offset + L_new))
 
         # Transpose to (B, H, L, D) for attention
         q = q.transpose(0, 2, 1, 3)  # (B, H_q, L_new, D)
