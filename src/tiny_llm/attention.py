@@ -190,12 +190,64 @@ def scaled_dot_product_attention_grouped(
 
     return result.reshape(expected_shape)
 
-
+# query: B..., H_q, L, E
+# key:   B..., H,   S, E
+# value: B..., H,   S, E
+# mask:  B..., H_q, L, S
+# out:   B..., H_q, L, E
 def flash_attention(
     query: mx.array,
     key: mx.array,
     value: mx.array,
     scale: float | None = None,
-    mask: mx.array | None = None,
+    mask: mx.array | str | None = None,
 ) -> mx.array:
-    pass
+    try:
+        from extensions import tiny_llm_ext
+    except ImportError as e:
+        raise ImportError("Failed to load C++ extension: {}".format(e)) from e
+
+    flash_attention_op = getattr(tiny_llm_ext, "flash_attention", None)
+    if flash_attention_op is None:
+        return scaled_dot_product_attention_grouped(
+            query,
+            key,
+            value,
+            scale=scale,
+            mask=mask,
+        )
+
+    factor = mx.rsqrt(mx.array(query.shape[-1])) if scale is None else mx.array(scale)
+    factor = factor.astype(query.dtype)
+
+    *B, H_q, L, E = query.shape
+    _, H, S, _ = key.shape
+    assert H_q % H == 0, "Number of query heads must be divisible by number of key/value heads"
+
+    query = mx.contiguous(query.reshape(-1, L, E))
+    key = mx.contiguous(key.reshape(-1, S, E))
+    value = mx.contiguous(value.reshape(-1, S, E))
+
+    is_causal = isinstance(mask, str) and mask == "causal"
+    N = query.shape[0]
+
+    if is_causal:
+        mask = mx.broadcast_to(causal_mask(L, S, mx.float32), (*B, H_q, L, S))
+    elif mask is None:
+        mask = mx.broadcast_to(mx.zeros((L, S), dtype=mx.float32), (*B, H_q, L, S))
+    else:
+        mask = mx.broadcast_to(mask, (*B, H_q, L, S))
+
+    mask = mx.contiguous(mask.reshape(N, L, S).astype(mx.float32))
+
+    result = flash_attention_op(
+        query,
+        key,
+        value,
+        mask,
+        factor,
+        is_causal=is_causal,
+        num_heads=H_q,
+        num_kv_heads=H,
+    )
+    return mx.contiguous(result.reshape(*B, H_q, L, E))

@@ -92,4 +92,77 @@ private:
     bool transpose_b_;
 };
 
+/**
+ * Flash attention
+ * Computes: softmax(q @ k.T * scale + mask) @ v
+ *
+ * All inputs are flattened to 3D head-batch tensors:
+ * q:    [N, L, E]
+ * k/v:  [N_kv, S, E]
+ * mask: [N, L, S]
+ *
+ * @param q Query tensor
+ * @param k Key tensor
+ * @param v Value tensor
+ * @param mask Attention mask tensor
+ * @param scale Attention scaling factor
+ * @param is_causal Whether to enable causal-mask fast path
+ * @param num_kv_heads Number of KV heads before flattening batch dims
+ * @param num_heads Number of query heads before flattening batch dims
+ * @param s Stream on which to schedule the operation
+ **/
+mx::array flash_attention(
+    const mx::array& q,
+    const mx::array& k,
+    const mx::array& v,
+    const mx::array& mask,
+    float scale,
+    bool is_causal,
+    int num_kv_heads,
+    int num_heads,
+    mx::StreamOrDevice s = {});
+
+class FlashAttention : public mx::Primitive {
+public:
+    explicit FlashAttention(
+        mx::Stream stream,
+        float scale,
+        bool is_causal,
+        int num_kv_heads,
+        int num_heads)
+        : mx::Primitive(stream),
+          scale_(scale),
+          is_causal_(is_causal),
+          num_kv_heads_(num_kv_heads),
+          num_heads_(num_heads) {}
+
+    void eval_cpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
+    void eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) override;
+
+    std::vector<mx::array> jvp(const std::vector<mx::array>& primals,
+                               const std::vector<mx::array>& tangents,
+                               const std::vector<int>& argnums) override;
+
+    std::vector<mx::array> vjp(const std::vector<mx::array>& primals,
+                               const std::vector<mx::array>& cotangents,
+                               const std::vector<int>& argnums,
+                               const std::vector<mx::array>& outputs) override;
+
+    std::pair<std::vector<mx::array>, std::vector<int>> vmap(
+        const std::vector<mx::array>& inputs,
+        const std::vector<int>& axes) override;
+
+    void print(std::ostream& os);
+
+    const char* name() const override { return "FlashAttention"; }
+
+    bool is_equivalent(const mx::Primitive& other) const override;
+
+private:
+    float scale_;
+    bool is_causal_;
+    int num_kv_heads_;
+    int num_heads_;
+};
+
 }  // namespace tiny_llm_ext
