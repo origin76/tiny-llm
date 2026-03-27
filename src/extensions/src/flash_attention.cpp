@@ -13,6 +13,10 @@
 #include "mlx/backend/cpu/encoder.h"
 #include "mlx/utils.h"
 
+#ifdef _METAL_
+#include "mlx/backend/metal/device.h"
+#endif
+
 namespace tiny_llm_ext {
 
 namespace {
@@ -260,9 +264,94 @@ void FlashAttention::eval_cpu(const std::vector<mx::array>& inputs, std::vector<
     });
 }
 
-void FlashAttention::eval_gpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
-    throw std::runtime_error("flash_attention: GPU implementation not yet added");
+#ifdef _METAL_
+
+void FlashAttention::eval_gpu(const std::vector<mx::array>& inputs, std::vector<mx::array>& outputs) {
+    auto& q = inputs[0];
+    auto& k = inputs[1];
+    auto& v = inputs[2];
+    auto& mask = inputs[3];
+    auto& out = outputs[0];
+
+    if (out.dtype() != mx::float32) {
+        throw std::runtime_error("flash_attention: output dtype must be float32");
+    }
+    if (!q.flags().row_contiguous) {
+        throw std::runtime_error("flash_attention: q must be contiguous");
+    }
+    if (!k.flags().row_contiguous) {
+        throw std::runtime_error("flash_attention: k must be contiguous");
+    }
+    if (!v.flags().row_contiguous) {
+        throw std::runtime_error("flash_attention: v must be contiguous");
+    }
+
+    const int N = static_cast<int>(q.shape()[0]);
+    const int L = static_cast<int>(q.shape()[1]);
+    const int S = static_cast<int>(k.shape()[1]);
+    const int E = static_cast<int>(q.shape()[2]);
+    constexpr int Br = 32;
+    constexpr int Bc = 32;
+
+    if (E > 128) {
+        throw std::runtime_error("flash_attention: GPU kernel currently requires E <= 128");
+    }
+
+    const int Tr = (L + Br - 1) / Br;
+    const int Tc = (S + Bc - 1) / Bc;
+
+    auto& s = stream();
+    auto& d = mx::metal::device(s.device);
+    out.set_data(mx::allocator::malloc(out.nbytes()));
+
+    auto library = d.get_library("tiny_llm_ext");
+    auto kernel = d.get_kernel("flash_attention_f32_e128", library);
+
+    auto& compute_encoder = d.get_command_encoder(s.index);
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(v, 2);
+    compute_encoder.set_input_array(mask, 3);
+    compute_encoder.set_output_array(out, 4);
+    compute_encoder.set_vector_bytes(mask.shape(), 5);
+    compute_encoder.set_vector_bytes(mask.strides(), 6);
+
+    compute_encoder.set_bytes(static_cast<int>(is_causal_), 7);
+    compute_encoder.set_bytes(N, 8);
+    compute_encoder.set_bytes(L, 9);
+    compute_encoder.set_bytes(S, 10);
+    compute_encoder.set_bytes(E, 11);
+    compute_encoder.set_bytes(num_kv_heads_, 12);
+    compute_encoder.set_bytes(num_heads_, 13);
+    compute_encoder.set_bytes(scale_, 14);
+    compute_encoder.set_bytes(Br, 15);
+    compute_encoder.set_bytes(Bc, 16);
+    compute_encoder.set_bytes(Tr, 17);
+    compute_encoder.set_bytes(Tc, 18);
+
+    const size_t tgp_size = kernel->maxTotalThreadsPerThreadgroup();
+    const size_t simd_width = kernel->threadExecutionWidth();
+    if (simd_width != 32) {
+        throw std::runtime_error("flash_attention: expected threadExecutionWidth == 32");
+    }
+    if (static_cast<size_t>(Br * Bc) > tgp_size) {
+        throw std::runtime_error("flash_attention: Br * Bc exceeds max threads per threadgroup");
+    }
+
+    MTL::Size grid_dims = MTL::Size(static_cast<size_t>(N), static_cast<size_t>(Tr), 1);
+    MTL::Size group_dims = MTL::Size(static_cast<size_t>(Bc), static_cast<size_t>(Br), 1);
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
+
+#else
+
+void FlashAttention::eval_gpu(const std::vector<mx::array>&, std::vector<mx::array>&) {
+    throw std::runtime_error("flash_attention: GPU implementation not available");
+}
+
+#endif
 
 void FlashAttention::print(std::ostream& os) {
     os << name() << "(scale=" << scale_ << ", is_causal=" << is_causal_

@@ -1,6 +1,6 @@
 import mlx.core as mx
 from .basics import silu
-from .attention import scaled_dot_product_attention_grouped
+from .attention import scaled_dot_product_attention_grouped, flash_attention, causal_mask
 from .layer_norm import RMSNorm
 from .positional_encoding import RoPE
 from typing import Any
@@ -41,6 +41,14 @@ class Qwen2MultiHeadAttention:
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
+        assert hidden_size % num_heads == 0, (
+            f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
+        )
+        assert num_heads % num_kv_heads == 0, (
+            f"num_heads {num_heads} must be divisible by num_kv_heads {num_kv_heads}"
+        )
+        self.head_dim = hidden_size // num_heads
+        self.scale = 1.0 / (self.head_dim ** 0.5)
         self.wq = wq
         self.wk = wk
         self.wv = wv
@@ -70,7 +78,7 @@ class Qwen2MultiHeadAttention:
         # Compute dimensions
         H_q = self.num_heads
         H = self.num_kv_heads
-        D = self.hidden_size // H_q
+        D = self.head_dim
 
         # Linear projections: output shape (B, L_new, H*D)
         q = quantized_linear(x, self.wq, self.bq)
@@ -92,22 +100,45 @@ class Qwen2MultiHeadAttention:
         v = v.transpose(0, 2, 1, 3)  # (B, H, L_new, D)
 
         # Update KV cache and fetch
-        k_cache, v_cache, L, _ = cache.update_and_fetch(k, v)
+        k_cache, v_cache, S_total, cache_mask = cache.update_and_fetch(
+            k,
+            v,
+            mask_length=L_new,
+            mask=mask,
+        )
 
         # Note: offset consistency check disabled for flexibility
         # In task_3, offset=0 with L_new=10 is treated as processing 10 tokens at once
         # In task_4, offset increments as we process 1 token at a time
 
-        # Compute attention at float32 precision
-        # q: (B, H_q, L_new, D), k: (B, H, L, D), v: (B, H, L, D)
-        # Output: (B, H_q, L_new, D)
-        attn_output = scaled_dot_product_attention_grouped(
-            q.astype(mx.float32),
-            k_cache.astype(mx.float32),
-            v_cache.astype(mx.float32),
-            scale=1.0 / (D ** 0.5),
-            mask=mask,
-        )
+        attn_mask = cache_mask
+        if isinstance(attn_mask, str) and attn_mask == "causal":
+            attn_mask = causal_mask(L_new, S_total, dtype=mx.float32)
+        elif attn_mask is None and isinstance(mask, str) and mask == "causal":
+            attn_mask = causal_mask(L_new, S_total, dtype=mx.float32)
+        elif attn_mask is not None:
+            attn_mask = attn_mask.astype(mx.float32)
+
+        q_fp32 = q.astype(mx.float32)
+        k_fp32 = k_cache.astype(mx.float32)
+        v_fp32 = v_cache.astype(mx.float32)
+
+        if self.use_flash_attention:
+            attn_output = flash_attention(
+                q_fp32,
+                k_fp32,
+                v_fp32,
+                scale=self.scale,
+                mask=attn_mask,
+            )
+        else:
+            attn_output = scaled_dot_product_attention_grouped(
+                q_fp32,
+                k_fp32,
+                v_fp32,
+                scale=self.scale,
+                mask=attn_mask,
+            )
         attn_output = attn_output.astype(x.dtype)
 
         # Transpose back to (B, L_new, H_q, D) and reshape to (B, L_new, H_q * D)
