@@ -304,8 +304,11 @@ void FlashAttention::eval_gpu(const std::vector<mx::array>& inputs, std::vector<
     auto& d = mx::metal::device(s.device);
     out.set_data(mx::allocator::malloc(out.nbytes()));
 
+    const bool decode_kernel = (L == 1);
     auto library = d.get_library("tiny_llm_ext");
-    auto kernel = d.get_kernel("flash_attention_f32_e128", library);
+    auto kernel = d.get_kernel(
+        decode_kernel ? "flash_attention_decode_f32_e128" : "flash_attention_f32_e128",
+        library);
 
     auto& compute_encoder = d.get_command_encoder(s.index);
     compute_encoder.set_compute_pipeline_state(kernel);
@@ -336,12 +339,18 @@ void FlashAttention::eval_gpu(const std::vector<mx::array>& inputs, std::vector<
     if (simd_width != 32) {
         throw std::runtime_error("flash_attention: expected threadExecutionWidth == 32");
     }
-    if (static_cast<size_t>(Br * Bc) > tgp_size) {
+    if (decode_kernel) {
+        if (simd_width > tgp_size) {
+            throw std::runtime_error("flash_attention: decode kernel exceeds max threads per threadgroup");
+        }
+    } else if (static_cast<size_t>(Br * Bc) > tgp_size) {
         throw std::runtime_error("flash_attention: Br * Bc exceeds max threads per threadgroup");
     }
 
-    MTL::Size grid_dims = MTL::Size(static_cast<size_t>(N), static_cast<size_t>(Tr), 1);
-    MTL::Size group_dims = MTL::Size(static_cast<size_t>(Bc), static_cast<size_t>(Br), 1);
+    MTL::Size grid_dims = decode_kernel ? MTL::Size(static_cast<size_t>(N), 1, 1)
+                                        : MTL::Size(static_cast<size_t>(N), static_cast<size_t>(Tr), 1);
+    MTL::Size group_dims = decode_kernel ? MTL::Size(simd_width, 1, 1)
+                                         : MTL::Size(static_cast<size_t>(Bc), static_cast<size_t>(Br), 1);
     compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
 }
 

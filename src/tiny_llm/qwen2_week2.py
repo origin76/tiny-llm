@@ -1,6 +1,6 @@
 import mlx.core as mx
 from .basics import silu
-from .attention import scaled_dot_product_attention_grouped, flash_attention, causal_mask
+from .attention import scaled_dot_product_attention_grouped, flash_attention
 from .layer_norm import RMSNorm
 from .positional_encoding import RoPE
 from typing import Any
@@ -111,33 +111,37 @@ class Qwen2MultiHeadAttention:
         # In task_3, offset=0 with L_new=10 is treated as processing 10 tokens at once
         # In task_4, offset increments as we process 1 token at a time
 
-        attn_mask = cache_mask
-        if isinstance(attn_mask, str) and attn_mask == "causal":
-            attn_mask = causal_mask(L_new, S_total, dtype=mx.float32)
-        elif attn_mask is None and isinstance(mask, str) and mask == "causal":
-            attn_mask = causal_mask(L_new, S_total, dtype=mx.float32)
-        elif attn_mask is not None:
-            attn_mask = attn_mask.astype(mx.float32)
+        attn_mask = cache_mask if cache_mask is not None else mask
 
         q_fp32 = q.astype(mx.float32)
         k_fp32 = k_cache.astype(mx.float32)
         v_fp32 = v_cache.astype(mx.float32)
 
         if self.use_flash_attention:
+            flash_mask = attn_mask
+            if flash_mask is not None and not (
+                isinstance(flash_mask, str) and flash_mask == "causal"
+            ):
+                flash_mask = flash_mask.astype(mx.float32)
             attn_output = flash_attention(
                 q_fp32,
                 k_fp32,
                 v_fp32,
                 scale=self.scale,
-                mask=attn_mask,
+                mask=flash_mask,
             )
         else:
+            grouped_mask = attn_mask
+            if grouped_mask is not None and not (
+                isinstance(grouped_mask, str) and grouped_mask == "causal"
+            ):
+                grouped_mask = grouped_mask.astype(mx.float32)
             attn_output = scaled_dot_product_attention_grouped(
                 q_fp32,
                 k_fp32,
                 v_fp32,
                 scale=self.scale,
-                mask=attn_mask,
+                mask=grouped_mask,
             )
         attn_output = attn_output.astype(x.dtype)
 

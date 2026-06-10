@@ -4,6 +4,101 @@
 
 using namespace metal;
 
+[[kernel]] void flash_attention_decode_f32_e128(
+    device const float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device const float* v [[buffer(2)]],
+    device const float* mask [[buffer(3)]],
+    device float* out [[buffer(4)]],
+    constant const int* mask_shape [[buffer(5)]],
+    constant const int64_t* mask_strides [[buffer(6)]],
+    constant const int& is_causal [[buffer(7)]],
+    constant const int& N [[buffer(8)]],
+    constant const int& L [[buffer(9)]],
+    constant const int& S [[buffer(10)]],
+    constant const int& E [[buffer(11)]],
+    constant const int& num_kv_heads [[buffer(12)]],
+    constant const int& num_heads [[buffer(13)]],
+    constant const float& scale [[buffer(14)]],
+    [[maybe_unused]] constant const int& Br [[buffer(15)]],
+    constant const int& Bc [[buffer(16)]],
+    [[maybe_unused]] constant const int& Tr [[buffer(17)]],
+    constant const int& Tc [[buffer(18)]],
+    uint2 group_id [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int kMaxE = 128;
+  constexpr float kNegLarge = -1.0e9f;
+
+  const int n = static_cast<int>(group_id.x);
+  if (n >= N || L != 1) {
+    return;
+  }
+
+  const int q_kv_ratio = num_heads / num_kv_heads;
+  const int kv_head = n / q_kv_ratio;
+
+  threadgroup float q_local[kMaxE];
+  threadgroup float o_local[kMaxE];
+
+  for (int e = static_cast<int>(lane); e < E; e += 32) {
+    q_local[e] = q[n * E + e];
+    o_local[e] = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float m_i = kNegLarge;
+  float l_i = 0.0f;
+
+  for (int tile_j = 0; tile_j < Tc; ++tile_j) {
+    const int col_idx = tile_j * Bc + static_cast<int>(lane);
+    const bool col_valid = col_idx < S;
+
+    float score = kNegLarge;
+    if (col_valid) {
+      const device float* k_row = k + (kv_head * S + col_idx) * E;
+      score = 0.0f;
+      for (int e = 0; e < E; ++e) {
+        score += q_local[e] * k_row[e];
+      }
+      score *= scale;
+
+      if (!is_causal) {
+        const int64_t mask_linear_idx = static_cast<int64_t>(n) * S + col_idx;
+        const int64_t mask_idx = elem_to_loc(mask_linear_idx, mask_shape, mask_strides, 3);
+        score += mask[mask_idx];
+      }
+    }
+
+    const float row_max = simd_max(score);
+    const float next_m = max(m_i, row_max);
+    const float prev_scale = exp(m_i - next_m);
+    m_i = next_m;
+
+    const float prob = col_valid ? exp(score - m_i) : 0.0f;
+    const float row_sum = simd_sum(prob);
+    l_i = prev_scale * l_i + row_sum;
+
+    for (int e = 0; e < E; ++e) {
+      float weighted_v = 0.0f;
+      if (col_valid) {
+        const device float* v_row = v + (kv_head * S + col_idx) * E;
+        weighted_v = prob * v_row[e];
+      }
+      const float value_sum = simd_sum(weighted_v);
+      if (lane == 0) {
+        o_local[e] = prev_scale * o_local[e] + value_sum;
+      }
+    }
+  }
+
+  if (lane == 0) {
+    const float inv_l = 1.0f / l_i;
+    for (int e = 0; e < E; ++e) {
+      out[n * E + e] = o_local[e] * inv_l;
+    }
+  }
+}
+
 [[kernel]] void flash_attention_f32_e128(
     device const float* q [[buffer(0)]],
     device const float* k [[buffer(1)]],
