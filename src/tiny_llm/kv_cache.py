@@ -3,16 +3,8 @@ from typing import Optional
 
 import mlx.core as mx
 
-from abc import ABC
-from typing import Optional
-import mlx.core as mx
-    
+
 class TinyKvCache(ABC):
-
-    def __init__(self):
-        self.key: Optional[mx.array] = None
-        self.value: Optional[mx.array] = None
-
     @abstractmethod
     def update_and_fetch(
         self,
@@ -21,7 +13,6 @@ class TinyKvCache(ABC):
         mask_length: int | None = None,
         mask: mx.array | str | None = None,
     ) -> tuple[mx.array, mx.array, int, Optional[mx.array]]:
-        
         """
         Update the key-value cache and fetch the updated key-value cache.
 
@@ -32,14 +23,33 @@ class TinyKvCache(ABC):
             mask: The mask to use (only used in batching mode)
 
         Returns:
-            A tuple of the updated key-value cache, the updated value, the sequence length, and the mask.
-            In week 2 day 1, we only need to return the updated key-value cache, the updated value.
-            In week 2 day 6/7, we need to return the updated key-value cache, the updated value, the sequence length, and the mask.
-            so that the batching kv cache can use this information to generate the mask.
+            The updated keys, updated values, sequence length, and mask. On
+            On Week 2 Day 1, the mask is passed through unchanged. Week 3 Day 1
+            uses the sequence length and mask to construct a dense batch.
         """
 
+    def release(self):
+        pass
+
+    def materialize(self):
+        """Evaluate owned K/V storage without changing its logical layout."""
+        pass
+
+    def update_and_fetch_paged(
+        self,
+        key: mx.array,
+        value: mx.array,
+        mask_length: int | None = None,
+        mask: mx.array | str | None = None,
+    ) -> "PagedKvMetadata":
+        pass
+
+    def rewind(self, n: int):
+        pass
+
+
 class BatchingKvCache(TinyKvCache):
-    def __init__(self, max_active_requests: int, max_seq_len: int):
+    def __init__(self, max_active_requests: int, max_seq_len: int | None = None):
         self.max_active_requests = max_active_requests
         self.max_seq_len = max_seq_len
 
@@ -52,6 +62,15 @@ class BatchingKvCache(TinyKvCache):
     ) -> tuple[mx.array, mx.array, int, Optional[mx.array]]:
         pass
 
+    def update_and_fetch_paged(
+        self,
+        keys: mx.array,
+        values: mx.array,
+        mask_length: int | None = None,
+        mask: mx.array | str | None = None,
+    ) -> "PagedKvMetadata":
+        pass
+
     def add_request(self, prefilled: TinyKvCache, id: int):
         pass
 
@@ -61,8 +80,7 @@ class BatchingKvCache(TinyKvCache):
 
 class TinyKvFullCache(TinyKvCache):
     def __init__(self):
-        self.key: Optional[mx.array] = None
-        self.value: Optional[mx.array] = None
+        self.key_values = None
         self.offset = 0
 
     def update_and_fetch(
@@ -72,16 +90,10 @@ class TinyKvFullCache(TinyKvCache):
         mask_length: int | None = None,
         mask: mx.array | str | None = None,
     ) -> tuple[mx.array, mx.array, int, Optional[mx.array]]:
-        # Same implementation as base class for now
-        if self.key is None:
-            self.key = key
-            self.value = value
-        else:
-            # Concatenate on sequence dimension (axis=2 for shape B x H x L x D)
-            self.key = mx.concatenate([self.key, key], axis=2)
-            self.value = mx.concatenate([self.value, value], axis=2)
+        pass
 
-        L = self.key.shape[2]
-        self.offset = L
+    def materialize(self):
+        pass
 
-        return self.key, self.value, L, mask
+    def rewind(self, n: int):
+        pass

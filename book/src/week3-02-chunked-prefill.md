@@ -1,0 +1,43 @@
+# 🚧 Week 3 Day 2: Chunked Prefill
+
+> 🚧 This chapter is under review and may change.
+
+A long prompt can monopolize the device while active decode requests wait for
+their next token. Chunked prefill limits the number of prompt tokens admitted in
+one scheduler step.
+
+```python
+for start in range(0, len(prompt_tokens), prefill_max_step):
+    chunk = prompt_tokens[start : start + prefill_max_step]
+    model(chunk, offset=start, cache=cache)
+```
+
+## Rectangular Causal Masks
+
+When a cache already holds `S - L` tokens and a chunk contributes `L` new
+tokens, the mask is `L x S`. Every query can attend to the old prefix and to
+earlier positions in its own chunk.
+
+## Materialize Between Chunks
+
+MLX is lazy. Extending an unevaluated cache repeatedly creates a long graph and
+can grow memory usage. Call each layer cache's `materialize()` hook after every
+chunk so the next scheduler iteration starts from materialized state. A dense
+cache evaluates its key/value tuple; a paged cache evaluates the page pool
+storage without first gathering it into a dense tensor.
+
+## Task: Bound Prefill Work
+
+Update `Request.try_prefill` in `src/tiny_llm/batch.py` to process at most
+`prefill_max_step` tokens, advance its offset, materialize the cache, and mark
+the request ready only when the full prompt is complete.
+
+```bash
+pdm run test --week 3 --day 2
+pdm run batch-main
+```
+
+Compare time-to-next-token for active decode requests with a small and a large
+prefill step. Smaller chunks improve fairness but add scheduling overhead.
+
+{{#include copyright.md}}

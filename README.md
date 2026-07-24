@@ -8,7 +8,7 @@ can build the model serving infrastructure from scratch and dig into the optimiz
 
 The goal is to learn the techniques behind efficiently serving a large language model (e.g., Qwen3 models).
 
-In week 1, you will implement the necessary components in Python (only Python!) to use the Qwen3 model to generate responses (e.g., attention, RoPE, etc). In week 2, you will implement the inference system which is similar to but a much simpler version of vLLM (e.g., KV cache, continuous batching, flash attention, etc). In week 3, we will cover more advanced topics and how the model interacts with the outside world.
+In week 1, you will implement the necessary components in Python (only Python!) to use the Qwen3 model to generate responses (e.g., attention, RoPE, etc). In week 2, **A Step Closer to vLLM**, you will add a KV cache first, then integrate and measure course-owned Metal decode and SIMD-matrix prefill kernels until the model reaches about 75% of MLX's decode performance. In week 3, **Build a Mini vLLM**, you will turn that fast model into a serving engine with continuous batching, chunked prefill, paged attention, and FlashAttention over paged KV. The seven-day Week 4 draft then builds a coding agent through an agent loop, bounded tools, safety checks, interactive sessions, context compaction, control and recovery, and held-out evaluation. Its multi-turn workload also extends the inference framework with reusable session KV state and checkpoint-aware cache rewind.
 
 Why MLX: nowadays it's easier to get a macOS-based local development environment than setting up an NVIDIA GPU.
 
@@ -26,7 +26,9 @@ You may join skyzh's Discord server and study with the tiny-llm community.
 
 ## Roadmap
 
-Week 1 and 2 is complete. Week 3 is in progress.
+Chapters substantially revised in this PR are marked as work in progress even
+when they build on original course material. Unchanged chapters retain their
+existing status, and all Week 4 application material remains work in progress.
 
 | Week + Chapter | Topic                                                       | Code | Test | Doc |
 | -------------- | ----------------------------------------------------------- | ---- | ---- | --- |
@@ -37,22 +39,29 @@ Week 1 and 2 is complete. Week 3 is in progress.
 | 1.5            | Load the Model                                              | ✅    | ✅   | ✅  |
 | 1.6            | Generate Responses (aka Decoding)                           | ✅    | ✅   | ✅  |
 | 1.7            | Sampling                                                    | ✅    | ✅   | ✅  |
-| 2.1            | Key-Value Cache                                             | ✅    | ✅   | ✅  |
-| 2.2            | Quantized Matmul and Linear - CPU                           | ✅    | ✅   | ✅  |
-| 2.3            | Quantized Matmul and Linear - GPU                           | ✅    | ✅   | ✅  |
-| 2.4            | Flash Attention 2 - CPU                                     | ✅    | ✅   | ✅  |
-| 2.5            | Flash Attention 2 - GPU                                     | ✅    | ✅   | ✅  |
-| 2.6            | Continuous Batching                                         | ✅    | ✅   | ✅  |
-| 2.7            | Chunked Prefill                                             | ✅    | ✅   | ✅  |
-| 3.1            | Paged Attention - Part 1                                    | ✅    | ✅   | 🚧  |
-| 3.2            | Paged Attention - Part 2                                    | ✅    | ✅   | 🚧  |
-| 3.3            | MoE (Mixture of Experts)                                    | ✅    | ✅   | 🚧  |
-| 3.4            | Speculative Decoding                                        | 🚧    | ✅   | 🚧  |
-| 3.5            | RAG Pipeline                                                | 🚧    | 🚧   | 🚧  |
-| 3.6            | AI Agent     / Tool Calling                                 | 🚧    | 🚧   | 🚧  |
-| 3.7            | Long Context                                                | 🚧    | 🚧   | 🚧  |
+| 2.1            | KV Cache                                                     | ✅    | ✅   | 🚧  |
+| 2.2            | Benchmarking and the MLX Baseline                            | 🚧    | 🚧   | 🚧  |
+| 2.3            | Quantized Matvec                                             | ✅    | ✅   | 🚧  |
+| 2.4            | Decode Attention                                             | 🚧    | 🚧   | 🚧  |
+| 2.5            | Fast Model Kernels                                           | 🚧    | 🚧   | 🚧  |
+| 2.6            | SIMD-Matrix Prefill                                          | ✅    | ✅   | 🚧  |
+| 3.1            | Continuous Batching                                           | ✅    | ✅   | 🚧  |
+| 3.2            | Chunked Prefill                                               | ✅    | ✅   | 🚧  |
+| 3.3            | Paged KV Cache                                                | ✅    | ✅   | 🚧  |
+| 3.4            | Direct Paged Attention                                        | ✅    | ✅   | 🚧  |
+| 3.5            | Paged FlashAttention                                          | ✅    | ✅   | 🚧  |
+| 3.6 (optional) | MoE (Mixture of Experts)                                     | ✅    | ✅   | ✅  |
+| 3.7 (optional) | Serving Performance Lab                                       | 🚧    | 🚧   | 🚧  |
+| 3.x (optional) | Speculative Decoding                                          | 🚧    | 🚧   | 🚧  |
+| 4.1            | Agent Loop                                                    | 🚧    | 🚧   | 🚧  |
+| 4.2            | Tools                                                         | 🚧    | 🚧   | 🚧  |
+| 4.3            | Safety and Validation                                         | 🚧    | 🚧   | 🚧  |
+| 4.4            | Interactive Sessions                                          | 🚧    | 🚧   | 🚧  |
+| 4.5            | Context Compaction                                            | 🚧    | 🚧   | 🚧  |
+| 4.6            | Control and Recovery                                          | 🚧    | 🚧   | 🚧  |
+| 4.7            | Evaluation                                                    | 🚧    | 🚧   | 🚧  |
 
-Other topics not covered: quantized/compressed kv cache, prefix/prompt cache; sampling, fine tuning; smaller kernels (softmax, silu, etc)
+Other topics not covered: quantized/compressed KV cache, cross-request prefix/prompt cache, fine-tuning, and long-context techniques.
 
 ## Star History
 

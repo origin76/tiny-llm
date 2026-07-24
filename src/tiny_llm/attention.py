@@ -9,20 +9,10 @@ def scaled_dot_product_attention_simple(
     scale: float | None = None,
     mask: mx.array | None = None,
 ) -> mx.array:
-    key = key.swapaxes(-1,-2)
-    softmax_input = mx.matmul(query, key)
-    if scale is None:
-        scale = 1.0 / (query.shape[-1] ** 0.5)
-    softmax_input = softmax_input * scale
-    if mask is not None:
-        softmax_input = softmax_input + mask
-    attention_weights = softmax(softmax_input, axis=-1)
-    output = mx.matmul(attention_weights, value)
-    return output
+    pass
 
 
 class SimpleMultiHeadAttention:
-    ### w_q/w_k/w_v: (H x D) x E
     def __init__(
         self,
         hidden_size: int,
@@ -32,16 +22,8 @@ class SimpleMultiHeadAttention:
         wv: mx.array,
         wo: mx.array,
     ):
-        assert hidden_size % num_heads == 0, "hidden_size must be divisible by num_heads"
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        self.wq = wq
-        self.wk = wk
-        self.wv = wv
-        self.wo = wo
+        pass
 
-    ### input shapes: N * L * E
     def __call__(
         self,
         query: mx.array,
@@ -49,74 +31,13 @@ class SimpleMultiHeadAttention:
         value: mx.array,
         mask: mx.array | None = None,
     ) -> mx.array:
-        N, L, _ = query.shape
-        H = self.num_heads
-        D = self.head_dim
-
-        # --------------------------------
-        # 1️⃣ Linear projections
-        # --------------------------------
-        Q = query @ self.wq.T # (N, L, E) @ (E, H*D) → (N, L, H*D)
-        K = key   @ self.wk.T
-        V = value @ self.wv.T
-
-        # --------------------------------
-        # 2️⃣ Split heads
-        # (N, L, H*D) → (N, L, H, D)
-        # --------------------------------
-        Q = Q.reshape(N, L, H, D)
-        K = K.reshape(N, L, H, D)
-        V = V.reshape(N, L, H, D)
-
-        # --------------------------------
-        # 3️⃣ Move head dimension forward
-        # (N, L, H, D) → (N, H, L, D)
-        # --------------------------------
-        Q = Q.swapaxes(1, 2)
-        K = K.swapaxes(1, 2)
-        V = V.swapaxes(1, 2)
-
-        # --------------------------------
-        # 5️⃣ Scaled dot-product attention
-        # --------------------------------
-        attn_output = scaled_dot_product_attention_simple(
-            Q, K, V, mask=mask
-        )  # (N, H, L, D)
-
-        # (N, H, L, D) → (N, L, H, D)
-        attn_output = attn_output.swapaxes(1, 2)
-
-        # (N, L, H, D) → (N, L, E)
-        attn_output = attn_output.reshape(N, L, self.hidden_size)
-
-        # --------------------------------
-        # 7️⃣ Final linear projection
-        # --------------------------------
-        out = attn_output @ self.wo.T  # (N, L, E)
-
-        return out
+        pass
 
 
 def causal_mask(L: int, S: int, dtype: mx.Dtype) -> mx.array:
-    i = mx.arange(L)[:, None]           # (L,1)
-    j = mx.arange(S)[None, :]           # (1,S)
+    pass
 
-    shift = S - L
 
-    mask = mx.where(j <= i + shift, 0.0, float("-inf"))
-    return mask.astype(dtype)
-
-# N.. is zero or more dimensions for batches
-# H_q is the number of query heads
-# H is the number of key/value heads (H_q must be divisible by H)
-# L is the query sequence length
-# S is the key/value sequence length
-# D is the head dimension
-# query: N.. x H_q x L x D
-# key: N.. x H x S x D
-# value: N.. x H x S x D
-# mask: N.. x H_q x L x S
-# output: N.. x H_q x L x D
 def scaled_dot_product_attention_grouped(
     query: mx.array,
     key: mx.array,
@@ -124,130 +45,17 @@ def scaled_dot_product_attention_grouped(
     scale: float | None = None,
     mask: mx.array | str | None = None,
 ) -> mx.array:
-    """
-    Grouped query attention (GQA) implementation using reshape + broadcast.
+    pass
 
-    query: N.. x H_q x L x D
-    key: N.. x H_kv x S x D
-    value: N.. x H_kv x S x D
-    mask: N.. x H_q x L x S or "causal"
-    output: N.. x H_q x L x D
-    """
-    H_q = query.shape[-3]
-    H_kv = key.shape[-3]
 
-    assert H_q % H_kv == 0, "Number of query heads must be divisible by number of key/value heads"
-
-    n_repeats = H_q // H_kv
-
-    # If no GQA, use simple implementation
-    if n_repeats == 1:
-        if isinstance(mask, str) and mask == "causal":
-            L = query.shape[-2]
-            S = key.shape[-2]
-            mask = causal_mask(L, S, dtype=query.dtype)
-            while mask.ndim < query.ndim:
-                mask = mask[None]
-        return scaled_dot_product_attention_simple(
-            query, key, value, scale=scale, mask=mask
-        )
-
-    # Compute scale factor
-    factor = mx.rsqrt(mx.array(query.shape[-1])) if scale is None else mx.array(scale)
-    factor = factor.astype(query.dtype)
-
-    # Get batch dimensions
-    B = query.shape[:-3]
-    expected_shape = query.shape
-
-    # Reshape for broadcast:
-    # query: (B, H_q, L, D) -> (B, 1, H_kv, n_repeats, L, D)
-    # key/value: (B, H_kv, S, D) -> (B, 1, H_kv, 1, S, D)
-    query = query.reshape(*B, -1, H_kv, n_repeats, *query.shape[-2:])
-    key = key.reshape(*B, -1, H_kv, 1, *key.shape[-2:])
-    value = value.reshape(*B, -1, H_kv, 1, *value.shape[-2:])
-
-    # Compute attention scores with broadcast
-    scores = mx.matmul(query, key.swapaxes(-2, -1)) * factor
-
-    # Handle mask
-    if mask is not None:
-        if isinstance(mask, str) and mask == "causal":
-            L = query.shape[-2]
-            S = key.shape[-2]
-            mask = causal_mask(L, S, dtype=scores.dtype)
-            while mask.ndim < scores.ndim:
-                mask = mask[None]
-        else:
-            # mask: (B, H_q, L, S) -> broadcast to (*B, H_q, L, S) -> reshape to match scores
-            mask = mx.broadcast_to(mask, (*B, H_q, query.shape[-2], key.shape[-2]))
-            # scores shape is (*B, 1, H_kv, n_repeats, L, S)
-            mask = mask.reshape(*B, 1, H_kv, n_repeats, query.shape[-2], key.shape[-2])
-        scores = scores + mask
-
-    # Compute attention output
-    result = mx.matmul(softmax(scores, axis=-1), value)
-
-    return result.reshape(expected_shape)
-
-# query: B..., H_q, L, E
-# key:   B..., H,   S, E
-# value: B..., H,   S, E
-# mask:  B..., H_q, L, S
-# out:   B..., H_q, L, E
-def flash_attention(
+def paged_attention(
     query: mx.array,
-    key: mx.array,
-    value: mx.array,
+    key_pages: mx.array,
+    value_pages: mx.array,
+    block_table: mx.array,
+    context_lens: mx.array,
+    page_size: int,
     scale: float | None = None,
     mask: mx.array | str | None = None,
 ) -> mx.array:
-    try:
-        from extensions import tiny_llm_ext
-    except ImportError as e:
-        raise ImportError("Failed to load C++ extension: {}".format(e)) from e
-
-    flash_attention_op = getattr(tiny_llm_ext, "flash_attention", None)
-    if flash_attention_op is None:
-        return scaled_dot_product_attention_grouped(
-            query,
-            key,
-            value,
-            scale=scale,
-            mask=mask,
-        )
-
-    factor = mx.rsqrt(mx.array(query.shape[-1])) if scale is None else mx.array(scale)
-    factor = factor.astype(query.dtype)
-
-    *B, H_q, L, E = query.shape
-    _, H, S, _ = key.shape
-    assert H_q % H == 0, "Number of query heads must be divisible by number of key/value heads"
-
-    query = mx.contiguous(query.reshape(-1, L, E))
-    key = mx.contiguous(key.reshape(-1, S, E))
-    value = mx.contiguous(value.reshape(-1, S, E))
-
-    is_causal = isinstance(mask, str) and mask == "causal"
-    N = query.shape[0]
-
-    if is_causal:
-        mask = mx.broadcast_to(causal_mask(L, S, mx.float32), (*B, H_q, L, S))
-    elif mask is None:
-        mask = mx.broadcast_to(mx.zeros((L, S), dtype=mx.float32), (*B, H_q, L, S))
-    else:
-        mask = mx.broadcast_to(mask, (*B, H_q, L, S))
-
-    mask = mx.contiguous(mask.reshape(N, L, S).astype(mx.float32))
-
-    result = flash_attention_op(
-        query,
-        key,
-        value,
-        mask,
-        factor,
-        is_causal=is_causal,
-        num_heads=H_q,
-        num_kv_heads=H,
-    )
-    return mx.contiguous(result.reshape(*B, H_q, L, E))
+    pass

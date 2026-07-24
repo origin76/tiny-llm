@@ -1,13 +1,15 @@
-# Week 3 Day 1: Paged Attention, Part 1
+# 🚧 Week 3 Day 3: Paged Attention, Part 1
+
+> 🚧 This chapter is under review and may change.
 
 In this chapter, we will design the **paged KV cache**. This is the storage abstraction behind paged attention.
 
-By the end of Week 2, our serving stack already supports:
+By the end of Week 3 Day 2, our serving stack already supports:
 
 - per-request KV cache
 - chunked prefill
 - continuous batching
-- FlashAttention
+- the Week 2 SIMD-matrix prefill operator
 
 That gives us a working miniature serving engine, but the memory layout is still too simple. KV for each request is treated as one growing dense tensor, and batching rebuilds dense K/V for all active requests. That approach is easy to teach, but it does not scale well once requests become long and numerous.
 
@@ -18,7 +20,7 @@ Paged attention starts by fixing the storage layout.
 - [vLLM Paged Attention Design](https://docs.vllm.ai/en/v0.18.0/design/paged_attention/)
 - [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180)
 
-## Why the Week 2 KV Layout Becomes Expensive
+## Why the Dense KV Layout Becomes Expensive
 
 Right now, the mental model looks like this:
 
@@ -73,7 +75,11 @@ page  3 -> tokens 8..9
 
 The logical sequence is still length 10. The difference is that the runtime is no longer forced to represent it as one contiguous tensor.
 
-In our Day 1 teaching implementation, those fixed-size pages live in one shared **page pool** owned by the model. Every layer cache receives that same pool, but each layer cache keeps its own `page_ids`, `page_lens`, and `offset`.
+In our Part 1 teaching implementation, the model owns one physical **page
+pool per transformer layer**. Request caches for the same layer share its pool,
+while every request-and-layer cache keeps its own `page_ids`, `page_lens`, and
+`offset`. A page id is therefore local to one layer, matching the K/V storage
+buffer that the attention kernel receives.
 
 In the reference solution, `page_size` is the physical page capacity. Unused tail slots are not part of the logical sequence; `page_lens` decides which prefix of each page is valid.
 
@@ -82,7 +88,7 @@ In the reference solution, `page_size` is the physical page capacity. Unused tai
 The page abstraction gives us two immediate wins:
 
 1. Appending a token usually updates only the current tail page in the pool.
-2. Finished requests can return their pages to a shared free list.
+2. Finished requests can return their pages to the layer's shared free list.
 
 This is the key memory-management idea behind paged attention systems such as vLLM.
 
@@ -90,15 +96,34 @@ This is the key memory-management idea behind paged attention systems such as vL
 
 ## 1. `PagePool`
 
-The model should own one pool with a model-wide page allocator and flat K/V page storage:
+The model should own one pool per layer, each with a free-page allocator and
+flat K/V page storage:
 
 ```plain
-free_pages: available page ids for the whole model
+free_pages: available page ids for this layer
 keys[page_id]:   physical key page
 values[page_id]: physical value page
 ```
 
-Each layer still has distinct K/V contents because each layer cache allocates its own physical pages. In this teaching version, each layer cache also has its own logical page table. That is simpler than nano-vllm's shared block table: layer 0 might own pages `[0, 1]`, while layer 1 owns pages `[2, 3]`, but both page sets came from the same model-owned pool.
+Requests share physical storage only when they are executing the same layer.
+Layer 0 and layer 1 may both use page ids `[0, 1]` because those ids address
+different buffers. Keeping the layer dimension outside `page_id` prevents a
+one-token write in one layer from copying or serializing the page storage for
+every other layer.
+
+The backing slab should grow geometrically rather than by exactly one page.
+Keep logical `num_pages` separate from physical capacity so callers still see
+only allocated pages while pool growth copies old storage logarithmically many
+times.
+
+Growing an exact-size slab from `p` to `p + 1` pages copies approximately
+`1 + 2 + ... + p` old pages, which is quadratic in the final page count.
+Starting with four pages and doubling capacity copies fewer than twice the
+eventual capacity across all growth events. Splitting the slab by transformer
+layer also prevents a new page in layer 0 from replacing the storage object
+used by every other layer. These two changes amortize allocator-copy work so
+most new-page allocations do not copy old pages, without changing the logical
+page table.
 
 In the reference solution, this becomes `TinyKvPagedPool`.
 
@@ -132,7 +157,26 @@ When new K/V arrives for one layer:
 3. otherwise allocate a new page and continue writing
 4. update cache metadata such as `page_lens` and `offset`
 
-This replaces the Week 2 pattern of repeatedly concatenating along the sequence dimension.
+This replaces the dense-cache pattern of repeatedly concatenating along the sequence dimension.
+
+### A slice assignment is not automatically a small copy
+
+MLX arrays are functional and lazily evaluated. Writing
+`pages[page_id, :, start:end, :] = values` may build an update whose output is
+the entire page tensor; the source code's small slice does not prove that only
+the new K/V bytes move. In the reference profile, a synchronized one-token
+page update cost about 159 µs per layer.
+
+Implement `paged_cache_update` as a small course extension primitive. Its
+output intentionally aliases the existing page buffer, and its Metal grid
+covers only `H * new_tokens * D` elements. Page storage is request state, so
+this mutation boundary is explicit and safe as long as the cache owns its page
+and attention depends on the returned array. Full-buffer copies remain only
+when geometric capacity grows.
+
+Test this behavior through the cache interface: append across a tail-page
+boundary, grow the slab, release and reuse page ids, and compare the gathered
+logical sequence with `TinyKvFullCache`.
 
 ## Prefill with Pages
 
@@ -183,7 +227,7 @@ The cleanest first implementation is **paged storage with dense gather**.
 
 That means:
 
-- pages in the shared pool are the source of truth,
+- pages in each layer pool are the source of truth,
 - layer caches stop owning one monolithic K/V tensor,
 - layer caches only track page metadata,
 - attention still receives dense K/V reconstructed from pages.
@@ -206,13 +250,13 @@ Add:
 Keep `TinyKvFullCache` in `src/tiny_llm/kv_cache.py` as a baseline and test
 oracle.
 
-The key Day 1 behavior is:
+The key Part 1 behavior is:
 
 1. write new K/V into the layer cache's tail page or newly allocated pages,
 2. gather the layer cache's pages back into dense K/V,
 3. feed that dense K/V into the old attention path.
 
-So Day 1 changes the storage model first, not the attention kernel yet.
+So Part 1 changes the storage model first, not the attention kernel yet.
 
 ## `src/tiny_llm/batch.py`
 
@@ -226,17 +270,18 @@ The scheduler should still:
 
 The difference is that freeing a request now means releasing all pages owned by its layer caches back to the pool.
 
-Day 1 also keeps a small `rewind(n)` lifecycle hook. Rewind is useful for speculative decoding: if some drafted tokens are rejected, the cache must forget their K/V. In the paged cache, rewind frees whole pages that are no longer needed and shortens the valid length of the final remaining page.
+Part 1 also keeps a small `rewind(n)` lifecycle hook. Rewind is useful for speculative decoding: if some drafted tokens are rejected, the cache must forget their K/V. In the paged cache, rewind frees whole pages that are no longer needed and shortens the valid length of the final remaining page.
 
-## Design Questions for Day 1
+## Design Questions for Part 1
 
 Before implementing, make sure the following are clear:
 
 1. What page size should this repo use for teaching?
 2. How do we represent the free-page allocator?
 3. How do we prove that paged storage reconstructs the same logical KV as `TinyKvFullCache`?
-4. How do layer cache handles share one pool while keeping their own page metadata?
+4. How do request cache handles share a layer pool while keeping their own page metadata?
 5. When do we materialize page writes to avoid MLX lazy-graph growth?
+6. How do we grow physical capacity without copying all old pages on every allocation?
 
 ## Task 1: Design `PagePool`
 
@@ -244,13 +289,20 @@ Before implementing, make sure the following are clear:
 src/tiny_llm/paged_kv_cache.py
 ```
 
-Design a model-owned page pool that:
+Design layer-owned page pools that:
 
-- owns the model-wide free-page allocator,
+- own one free-page allocator per layer,
 - stores flat fixed-size K/V pages,
 - allocates and frees page ids,
 - supports writing a chunk into page storage,
-- is shared by every layer cache created by the model.
+- grows backing capacity geometrically,
+- updates only the appended physical slice between growth events,
+- is shared by all request caches for that layer, but not by other layers.
+
+Test logical size and physical capacity separately. Allocating the fifth page,
+for example, may create capacity for eight pages, but `key_pages` and
+`value_pages` exposed to the attention runtime should contain only the five
+allocated page ids.
 
 ## Task 2: Design `PagedRequestCache`
 
@@ -276,7 +328,36 @@ src/tiny_llm/qwen3_week3.py
 Build a compatibility path that reconstructs dense K/V from pages and compares it against `TinyKvFullCache`.
 
 This gives us a correctness check before we change the attention path itself.
+Instantiate the Week 3 model with `enable_paged_attention=False` in this
+chapter so its attention reads the gathered dense tensors. Day 4 switches the
+same model to page-table metadata and the paged kernel.
+
+Run that cumulative checkpoint through the normal generation and benchmark
+entry points:
+
+```bash
+pdm run main --solution tiny_llm --loader week3 \
+  --disable-paged-attention --model qwen3-0.6b
+
+pdm run bench --solution tiny_llm --loader week3 \
+  --disable-paged-attention --model qwen3-0.6b
+```
 
 In the next chapter, we will take the next step: instead of gathering dense K/V before attention, we will pass runtime metadata such as `block_table` directly into a paged attention path.
+
+## What Paging Buys on a Mac
+
+Apple silicon's unified memory removes the discrete-device transfer boundary,
+but it does not remove allocation, fragmentation, or copying inside the
+GPU-visible heap.
+Fixed-size pages still let a server reuse freed capacity, grow requests without
+reserving their maximum sequence length, and batch requests with different
+context lengths. These are capacity and lifecycle wins. They should be measured
+with live-request count, allocated bytes, fragmentation, and scheduler
+throughput—not inferred from one request's token latency.
+
+```bash
+pdm run test --week 3 --day 3
+```
 
 {{#include copyright.md}}

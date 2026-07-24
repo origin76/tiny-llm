@@ -1,10 +1,6 @@
-import mlx.core as mx
 from typing import Any
 
-try:
-    from extensions.tiny_llm_ext import quantized_matmul as _quantized_matmul
-except ImportError as e:
-    raise ImportError("Failed to load C++ extension: {}".format(e)) from e
+import mlx.core as mx
 
 
 def dequantize_linear(mx_layer: Any) -> mx.array:
@@ -15,15 +11,10 @@ def dequantize_linear(mx_layer: Any) -> mx.array:
         mx_layer.group_size,
         mx_layer.bits,
     )
-    return w
+    return w.astype(mx.bfloat16)
 
 
 class QuantizedWeights:
-    """
-    Weight: (K,N/8) uint32 
-    scales: (K,N/G) float16
-    biases: (K,N/G) float16
-    """
     def __init__(
         self,
         scales: mx.array,
@@ -31,21 +22,36 @@ class QuantizedWeights:
         group_size: int,
         bits: int,
         weight: mx.array,
+        use_simdgroup_matmul: bool = False,
+        use_simdgroup_matvec: bool = True,
+        use_split_k_matmul: bool = False,
     ):
         self.scales = scales
         self.biases = biases
         self.group_size = group_size
         self.bits = bits
         self.weight = weight
+        self.use_simdgroup_matmul = use_simdgroup_matmul
+        self.use_simdgroup_matvec = use_simdgroup_matvec
+        self.use_split_k_matmul = use_split_k_matmul
 
     @staticmethod
-    def from_mlx_layer(mlx_layer: Any) -> "QuantizedWeights":
+    def from_mlx_layer(
+        mlx_layer: Any,
+        use_simdgroup_matmul: bool = False,
+        use_simdgroup_matvec: bool = True,
+        use_split_k_matmul: bool = False,
+    ) -> "QuantizedWeights":
+        biases = mlx_layer.biases
         return QuantizedWeights(
-            scales=mlx_layer.scales,
-            biases=mlx_layer.biases,
+            scales=mlx_layer.scales.astype(mx.bfloat16),
+            biases=None if biases is None else biases.astype(mx.bfloat16),
             group_size=mlx_layer.group_size,
             bits=mlx_layer.bits,
             weight=mlx_layer.weight,
+            use_simdgroup_matmul=use_simdgroup_matmul,
+            use_simdgroup_matvec=use_simdgroup_matvec,
+            use_split_k_matmul=use_split_k_matmul,
         )
 
 
@@ -57,16 +63,44 @@ def quantized_matmul(
     a: mx.array,
     b: mx.array,
     transpose_b: bool = False,
+    use_simdgroup: bool = False,
+    use_split_k: bool = False,
 ) -> mx.array:
-    return _quantized_matmul(
-        scales=scales,
-        biases=biases,
-        group_size=group_size,
-        bits=bits,
-        a=a,
-        b=b,
-        transpose_b=transpose_b,
-    )
+    pass
+
+
+def dequantize_weights(
+    weight: mx.array,
+    scales: mx.array,
+    biases: mx.array | None,
+    group_size: int,
+    bits: int,
+) -> mx.array:
+    pass
+
+
+def quantized_matvec_custom(
+    scales: mx.array,
+    biases: mx.array,
+    group_size: int,
+    bits: int,
+    a: mx.array,
+    b: mx.array,
+    transpose_b: bool = False,
+) -> mx.array:
+    pass
+
+
+def quantized_matmul_vanilla(
+    scales: mx.array,
+    biases: mx.array,
+    group_size: int,
+    bits: int,
+    a: mx.array,
+    b: mx.array,
+    transpose_b: bool = False,
+) -> mx.array:
+    pass
 
 
 def quantized_linear(
@@ -74,15 +108,4 @@ def quantized_linear(
     w: QuantizedWeights,
     bias: mx.array | None = None,
 ) -> mx.array:
-    output = quantized_matmul(
-        scales=w.scales,
-        biases=w.biases,
-        group_size=w.group_size,
-        bits=w.bits,
-        a=x,
-        b=w.weight,
-        transpose_b=True,
-    )
-    if bias is not None:
-        output = output + bias
-    return output
+    pass
