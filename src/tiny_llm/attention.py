@@ -82,9 +82,23 @@ class SimpleMultiHeadAttention:
 
 
 def causal_mask(L: int, S: int, dtype: mx.Dtype) -> mx.array:
-    pass
+    return mx.triu(
+            mx.full((L, S), -mx.inf),
+            k= S - L + 1,
+        ).astype(dtype)
 
+# N.. is zero or more dimensions for batches
+# H_q is the number of query heads
+# H is the number of key/value heads (H_q must be divisible by H)
+# L is the query sequence length
+# S is the key/value sequence length
+# D is the head dimension
 
+# query: N.. x H_q x L x D
+# key: N.. x H x S x D
+# value: N.. x H x S x D
+# mask: N.. x H_q x L x S
+# output: N.. x H_q x L x D
 def scaled_dot_product_attention_grouped(
     query: mx.array,
     key: mx.array,
@@ -92,7 +106,62 @@ def scaled_dot_product_attention_grouped(
     scale: float | None = None,
     mask: mx.array | str | None = None,
 ) -> mx.array:
-    pass
+    h_q = query.shape[-3]
+    h = key.shape[-3]
+    group_size = h_q // h
+
+    batch_shape = query.shape[:-3]
+    l = query.shape[-2]
+    d = query.shape[-1]
+    s = key.shape[-2]
+
+    # [..., H_q, L, D] -> [..., H, G, L, D]
+    query = query.reshape(
+        *batch_shape,
+        h,
+        group_size,
+        l,
+        d,
+    )
+
+    # [..., H, S, D] -> [..., H, 1, S, D]
+    key = mx.expand_dims(key, axis=-3)
+    value = mx.expand_dims(value, axis=-3)
+
+    if mask is not None:
+        if isinstance(mask, str):
+            if mask != "causal":
+                raise ValueError(f"Unknown mask type: {mask!r}")
+
+            # [L, S]，自动共享给所有 batch/head/group
+            mask = causal_mask(l, s, query.dtype)
+        else:
+            # 用户传入的是 [..., H_q, L, S]
+            # 此时才需要 H_q -> H × G
+            mask = mask.reshape(
+                *mask.shape[:-3],
+                h,
+                group_size,
+                l,
+                s,
+            )
+
+    output = scaled_dot_product_attention_simple(
+        query,
+        key,
+        value,
+        scale=scale,
+        mask=mask,
+    )
+
+    # [..., H, G, L, D] -> [..., H_q, L, D]
+    return output.reshape(
+        *batch_shape,
+        h_q,
+        l,
+        d,
+    )
+
 
 
 def paged_attention(
