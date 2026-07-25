@@ -53,22 +53,4 @@ NB_MODULE(_ext, m) {
             array: Result of quantized matmul, shape [..., m, n]
       )");
 
-    m.def("flash_attention", &tiny_llm_ext::flash_attention, "query"_a, "key"_a, "value"_a, "mask"_a,
-          "scale"_a = 1.0f, "is_causal"_a = false, "num_kv_heads"_a, "num_heads"_a, "stream"_a = nb::none(),
-          R"(
-        Flash attention
-
-        Args:
-            query (array): Query tensor with shape [N, L, E].
-            key (array): Key tensor with shape [N_kv, S, E].
-            value (array): Value tensor with shape [N_kv, S, E].
-            mask (array): Mask tensor with shape [N, L, S].
-            scale (float): Scaling factor applied to attention scores.
-            is_causal (bool): Enable causal-mask fast path.
-            num_kv_heads (int): Number of KV heads before flattening batch dims.
-            num_heads (int): Number of query heads before flattening batch dims.
-
-        Returns:
-            array: Result of flash attention, shape [N, L, E]
-      )");
 }
