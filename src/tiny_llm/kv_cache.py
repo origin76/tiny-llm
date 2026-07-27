@@ -82,6 +82,9 @@ class TinyKvFullCache(TinyKvCache):
     def __init__(self):
         self.key_values = None
         self.offset = 0
+        self.keys : mx.array | None = None
+        self.values : mx.array | None = None
+        self.offset = 0
 
     def update_and_fetch(
         self,
@@ -90,7 +93,23 @@ class TinyKvFullCache(TinyKvCache):
         mask_length: int | None = None,
         mask: mx.array | str | None = None,
     ) -> tuple[mx.array, mx.array, int, Optional[mx.array]]:
-        pass
+        if self.keys is None:
+            self.keys = key
+            self.values = value
+        else:
+            self.keys = mx.concatenate(
+                [self.keys, key],
+                axis=-2,
+            )
+            self.values = mx.concatenate(
+                [self.values, value],
+                axis=-2,
+            )
+
+        self.offset += key.shape[-2]
+
+        # 当前阶段原样返回 mask，包括字符串 "causal"
+        return self.keys, self.values, self.offset, mask
 
     def materialize(self):
         pass
