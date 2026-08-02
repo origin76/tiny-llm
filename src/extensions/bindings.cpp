@@ -32,8 +32,9 @@ NB_MODULE(_ext, m) {
             array: ``alpha * x + beta * y``
       )");
 
-	    m.def("quantized_matmul", &tiny_llm_ext::quantized_matmul, "scales"_a, "biases"_a, "group_size"_a, "bits"_a,
-	          "a"_a, "b"_a, nb::kw_only(), "transpose_b"_a = false, "stream"_a = nb::none(),
+	m.def("quantized_matmul", &tiny_llm_ext::quantized_matmul, "scales"_a, "biases"_a, "group_size"_a, "bits"_a,
+	          "a"_a, "b"_a, nb::kw_only(), "transpose_b"_a = false, "use_simdgroup"_a = true,
+	          "use_split_k"_a = false, "stream"_a = nb::none(),
 	          R"(
 	        Quantized matrix multiplication
 	

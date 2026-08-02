@@ -35,6 +35,8 @@ mx::array quantized_matmul(
     const mx::array& a,           // Input activation
     const mx::array& b,           // Quantized weight
     bool transpose_b = false,     // Whether to transpose b
+    bool use_simdgroup = true,    // Use the decode SIMD matvec for M <= 8
+    bool use_split_k = false,     // Reserved for the Day 7 checkpoint
     mx::StreamOrDevice s = {}     // Stream
 );
 
@@ -48,11 +50,15 @@ public:
         mx::Stream stream,
         int group_size,
         int bits,
-        bool transpose_b
+        bool transpose_b,
+        bool use_simdgroup,
+        bool use_split_k
     ) : mx::Primitive(stream),
         group_size_(group_size),
         bits_(bits),
-        transpose_b_(transpose_b) {}
+        transpose_b_(transpose_b),
+        use_simdgroup_(use_simdgroup),
+        use_split_k_(use_split_k) {}
 
     /**
      * A primitive must know how to evaluate itself on the CPU/GPU
@@ -90,6 +96,8 @@ private:
     int group_size_;
     int bits_;
     bool transpose_b_;
+    bool use_simdgroup_;
+    bool use_split_k_;
 };
 
 /**

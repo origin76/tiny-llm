@@ -2,9 +2,9 @@ from typing import Any
 
 import mlx.core as mx
 
-from .embedding import Embedding
+from .embedding import Embedding, QuantizedEmbedding
 from .kv_cache import TinyKvCache, TinyKvFullCache
-from .quantize import QuantizedWeights, dequantize_linear
+from .quantize import QuantizedWeights, dequantize_linear, quantized_linear
 from .basics import linear, silu
 from .attention import scaled_dot_product_attention_grouped
 from .layer_norm import RMSNorm
@@ -26,6 +26,12 @@ WEEK2_CHECKPOINTS = (
     "simd-matmul",
     "split-k",
 )
+
+
+def _linear(x: mx.array, weight: mx.array | QuantizedWeights) -> mx.array:
+    if isinstance(weight, QuantizedWeights):
+        return quantized_linear(x, weight)
+    return linear(x, weight)
 
 
 def _readable_rope_offset(
@@ -112,9 +118,9 @@ class Qwen3MultiHeadAttention:
         mask: mx.array | str | None = None,
     ) -> mx.array:
         B, L, _ = x.shape
-        q = linear(x, self.wq).reshape(B, L, self.num_heads, self.head_dim)
-        k = linear(x, self.wk).reshape(B, L, self.num_kv_heads, self.head_dim)
-        v = linear(x, self.wv).reshape(B, L, self.num_kv_heads, self.head_dim)
+        q = _linear(x, self.wq).reshape(B, L, self.num_heads, self.head_dim)
+        k = _linear(x, self.wk).reshape(B, L, self.num_kv_heads, self.head_dim)
+        v = _linear(x, self.wv).reshape(B, L, self.num_kv_heads, self.head_dim)
         q = self.q_norm(q)
         k = self.k_norm(k)
 
@@ -143,7 +149,7 @@ class Qwen3MultiHeadAttention:
             ).astype(x.dtype)
 
         x = x.transpose(0, 2, 1, 3).reshape(B, L, self.num_heads * self.head_dim)
-        return linear(x, self.wo)
+        return _linear(x, self.wo)
 
 
 class Qwen3MLP:
@@ -164,10 +170,10 @@ class Qwen3MLP:
         self.use_fast_swiglu = use_fast_swiglu
 
     def __call__(self, x: mx.array) -> mx.array:
-        gate = linear(x, self.w_gate)
-        up = linear(x, self.w_up)
+        gate = _linear(x, self.w_gate)
+        up = _linear(x, self.w_up)
         hidden = swiglu(gate, up) if self.use_fast_swiglu else silu(gate) * up
-        return linear(hidden, self.w_down)
+        return _linear(hidden, self.w_down)
 
 
 
@@ -262,6 +268,9 @@ class Qwen3ModelWeek2:
             )
         checkpoint_index = WEEK2_CHECKPOINTS.index(checkpoint)
         self.checkpoint = checkpoint
+        use_quantized_weights = checkpoint_index >= WEEK2_CHECKPOINTS.index(
+            "quantized-matvec"
+        )
         use_fast_rms_norm = checkpoint_index >= WEEK2_CHECKPOINTS.index("rmsnorm")
         use_fast_rope = checkpoint_index >= WEEK2_CHECKPOINTS.index("rope")
         use_fast_swiglu = checkpoint_index >= WEEK2_CHECKPOINTS.index("swiglu")
@@ -275,11 +284,24 @@ class Qwen3ModelWeek2:
         precision = mx.bfloat16
         self.precision = precision
 
-        self.embedding = Embedding(
-            vocab_size=self.vocab_size,
-            embedding_dim=self.hidden_size,
-            weight=dequantize_linear(mlx_model.model.embed_tokens),
-        )
+        def model_weight(layer: Any) -> mx.array | QuantizedWeights:
+            if use_quantized_weights:
+                return QuantizedWeights.from_mlx_layer(layer)
+            return dequantize_linear(layer).astype(mx.bfloat16)
+
+        embedding_weight = model_weight(mlx_model.model.embed_tokens)
+        if isinstance(embedding_weight, QuantizedWeights):
+            self.embedding = QuantizedEmbedding(
+                vocab_size=self.vocab_size,
+                embedding_dim=self.hidden_size,
+                weight=embedding_weight,
+            )
+        else:
+            self.embedding = Embedding(
+                vocab_size=self.vocab_size,
+                embedding_dim=self.hidden_size,
+                weight=embedding_weight,
+            )
         self.layers_inner = []
 
         for i in range(mlx_model.args.num_hidden_layers):
@@ -290,15 +312,15 @@ class Qwen3ModelWeek2:
                 head_dim=mlx_model.args.head_dim,
                 intermediate_size=mlx_model.args.intermediate_size,
                 rms_norm_eps=mlx_model.args.rms_norm_eps,
-                wq=dequantize_linear(mlx_model.model.layers[i].self_attn.q_proj),
-                wk=dequantize_linear(mlx_model.model.layers[i].self_attn.k_proj),
-                wv=dequantize_linear(mlx_model.model.layers[i].self_attn.v_proj),
-                wo=dequantize_linear(mlx_model.model.layers[i].self_attn.o_proj),
+                wq=model_weight(mlx_model.model.layers[i].self_attn.q_proj),
+                wk=model_weight(mlx_model.model.layers[i].self_attn.k_proj),
+                wv=model_weight(mlx_model.model.layers[i].self_attn.v_proj),
+                wo=model_weight(mlx_model.model.layers[i].self_attn.o_proj),
                 q_norm=mlx_model.model.layers[i].self_attn.q_norm.weight,
                 k_norm=mlx_model.model.layers[i].self_attn.k_norm.weight,
-                w_gate=dequantize_linear(mlx_model.model.layers[i].mlp.gate_proj),
-                w_up=dequantize_linear(mlx_model.model.layers[i].mlp.up_proj),
-                w_down=dequantize_linear(mlx_model.model.layers[i].mlp.down_proj),
+                w_gate=model_weight(mlx_model.model.layers[i].mlp.gate_proj),
+                w_up=model_weight(mlx_model.model.layers[i].mlp.up_proj),
+                w_down=model_weight(mlx_model.model.layers[i].mlp.down_proj),
                 w_input_layernorm=mlx_model.model.layers[i].input_layernorm.weight,
                 w_post_attention_layernorm=mlx_model.model.layers[
                     i
@@ -317,7 +339,7 @@ class Qwen3ModelWeek2:
             eps=mlx_model.args.rms_norm_eps,
         )
         if not mlx_model.args.tie_word_embeddings:
-            self.w_lm_head = dequantize_linear(mlx_model.lm_head)
+            self.w_lm_head = model_weight(mlx_model.lm_head)
         else:
             self.w_lm_head = None
         self.mlx_model = mlx_model
@@ -368,6 +390,6 @@ class Qwen3ModelWeek2:
         if self.w_lm_head is None:
             logits = self.embedding.as_linear(hidden_states)
         else:
-            logits = linear(hidden_states, self.w_lm_head)
+            logits = _linear(hidden_states, self.w_lm_head)
 
         return logits

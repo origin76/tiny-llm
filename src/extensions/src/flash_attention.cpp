@@ -310,7 +310,7 @@ void FlashAttention::eval_gpu(const std::vector<mx::array>& inputs, std::vector<
         decode_kernel ? "flash_attention_decode_f32_e128" : "flash_attention_f32_e128",
         library);
 
-    auto& compute_encoder = d.get_command_encoder(s.index);
+    auto& compute_encoder = mx::metal::get_command_encoder(s);
     compute_encoder.set_compute_pipeline_state(kernel);
 
     compute_encoder.set_input_array(q, 0);

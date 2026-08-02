@@ -212,6 +212,8 @@ mx::array quantized_matmul(
     const mx::array& a,
     const mx::array& b,
     bool transpose_b,
+    bool use_simdgroup,
+    bool use_split_k,
     mx::StreamOrDevice s) {
     validate_quantized_matmul_inputs(scales, biases, group_size, bits, a, b, transpose_b);
 
@@ -225,7 +227,8 @@ mx::array quantized_matmul(
         /* const mx::Shape& shape = */ out_shape,
         /* mx::Dtype dtype = */ a.dtype(),
         /* std::shared_ptr<mx::Primitive> primitive = */
-        std::make_shared<QuantizedMatmul>(to_stream(s), group_size, bits, transpose_b),
+        std::make_shared<QuantizedMatmul>(
+            to_stream(s), group_size, bits, transpose_b, use_simdgroup, use_split_k),
         /* const std::vector<mx::array>& inputs = */ std::vector<mx::array>{scales, biases, a, b});
 }
 
@@ -267,8 +270,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<mx::array>& inputs, std::vector
     auto& b = inputs[3];
     auto& out = outputs[0];
 
-    if (group_size_ != 64) {
-        throw std::runtime_error("quantized_matmul: GPU only supports group_size=64");
+    if (group_size_ != 128) {
+        throw std::runtime_error("quantized_matmul: GPU only supports group_size=128");
     }
     if (bits_ != 4) {
         throw std::runtime_error("quantized_matmul: GPU only supports 4-bit quantization");
@@ -319,13 +322,20 @@ void QuantizedMatmul::eval_gpu(const std::vector<mx::array>& inputs, std::vector
     out.set_data(mx::allocator::malloc(out.nbytes()));
 
     auto library = d.get_library("tiny_llm_ext");
-    const bool is_f16 = (a.dtype() == mx::float16);
-    const char* kernel_name = nullptr;
-    if (transpose_b_) {
-        kernel_name = is_f16 ? "quantized_matmul_w4a16_g64_t_f16" : "quantized_matmul_w4a16_g64_t_bf16";
-    } else {
-        kernel_name = is_f16 ? "quantized_matmul_w4a16_g64_nt_f16" : "quantized_matmul_w4a16_g64_nt_bf16";
+    if (!transpose_b_) {
+        throw std::runtime_error("quantized_matmul: GPU requires transpose_b=True");
     }
+    if (use_split_k_) {
+        throw std::runtime_error("quantized_matmul: split-K is introduced on Week 2 Day 7");
+    }
+
+    const bool use_matvec = use_simdgroup_ && m <= 8;
+    const bool is_f16 = a.dtype() == mx::float16;
+    const char* kernel_name = use_matvec
+        ? (is_f16 ? "quantized_matvec_x4_fast_w4a16_g128_f16"
+                  : "quantized_matvec_x4_fast_w4a16_g128_bf16")
+        : (is_f16 ? "quantized_matmul_vanilla_w4a16_g128_f16"
+                  : "quantized_matmul_vanilla_w4a16_g128_bf16");
     auto kernel = d.get_kernel(kernel_name, library);
 
     auto& compute_encoder = mx::metal::get_command_encoder(s);
@@ -344,25 +354,26 @@ void QuantizedMatmul::eval_gpu(const std::vector<mx::array>& inputs, std::vector
     compute_encoder.set_bytes(k_i, 6);
     compute_encoder.set_bytes(n_i, 7);
 
-    size_t tgp_size = kernel->maxTotalThreadsPerThreadgroup();
-
-    // Single strategy launch tuned for stable mixed prefill/decode throughput.
-    int x_size = 16;
-    int y_cap = 16;
-    if (static_cast<size_t>(x_size) > tgp_size) {
-        x_size = static_cast<int>(tgp_size);
+    if (use_matvec) {
+        constexpr int outputs_per_simdgroup = 4;
+        constexpr int simdgroups_per_threadgroup = 2;
+        constexpr int outputs_per_threadgroup =
+            outputs_per_simdgroup * simdgroups_per_threadgroup;
+        const int column_tiles =
+            (static_cast<int>(n) + outputs_per_threadgroup - 1) /
+            outputs_per_threadgroup;
+        compute_encoder.dispatch_threadgroups(
+            MTL::Size(static_cast<size_t>(m) * column_tiles, 1, 1),
+            MTL::Size(simdgroups_per_threadgroup * 32, 1, 1));
+        return;
     }
 
-    int y_size = static_cast<int>(tgp_size / static_cast<size_t>(x_size));
-    if (y_size < 1) {
-        y_size = 1;
-    } else if (y_size > y_cap) {
-        y_size = y_cap;
-    }
-
-    MTL::Size grid_dims = MTL::Size(static_cast<size_t>(m), static_cast<size_t>(n), 1);
-    MTL::Size group_dims = MTL::Size(static_cast<size_t>(x_size), static_cast<size_t>(y_size), 1);
-    compute_encoder.dispatch_threads(grid_dims, group_dims);
+    const size_t tgp_size = kernel->maxTotalThreadsPerThreadgroup();
+    const int x_size = m <= 16 ? 16 : 32;
+    const int y_size = static_cast<int>(tgp_size) / x_size;
+    compute_encoder.dispatch_threadgroups(
+        MTL::Size((m + x_size - 1) / x_size, (n + y_size - 1) / y_size, 1),
+        MTL::Size(x_size, y_size, 1));
 }
 
 #endif
@@ -399,7 +410,9 @@ std::pair<std::vector<mx::array>, std::vector<int>> QuantizedMatmul::vmap(
 bool QuantizedMatmul::is_equivalent(const mx::Primitive& other) const {
     const QuantizedMatmul& r_other = static_cast<const QuantizedMatmul&>(other);
     return group_size_ == r_other.group_size_ && bits_ == r_other.bits_ &&
-           transpose_b_ == r_other.transpose_b_;
+           transpose_b_ == r_other.transpose_b_ &&
+           use_simdgroup_ == r_other.use_simdgroup_ &&
+           use_split_k_ == r_other.use_split_k_;
 }
 
 }  // namespace tiny_llm_ext
